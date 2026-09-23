@@ -1,28 +1,28 @@
 package main
 
-// Command api is the entrypoint for the backend-challenge-go HTTP
-// service. All wiring lives here: Fx reads the fx.Provide list,
-// figures out the dependency graph, and constructs everything in the
-// right order.
-
 import (
 	"net/http"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
 
 	"github.com/TakedaB/backend-challenge-go/internal/httpapi"
+	"github.com/TakedaB/backend-challenge-go/internal/infra/postgres"
 )
 
 func main() {
 	fx.New(
 		fx.Provide(
+			postgres.NewConfigFromEnv,
+			postgres.NewPool,
 			httpapi.NewRouter,
 			httpapi.NewHTTPServer,
 		),
-		// fx.Invoke forces Fx to actually build *http.Server (and
-		// everything it depends on) even though nothing else in the
-		// graph asks for one directly — without this, Fx would never
-		// construct it, since Go doesn't eagerly build unused values.
+		// Both invokes exist purely to force Fx to build things nothing
+		// else in the graph asks for: *http.Server (the HTTP server
+		// itself) and *pgxpool.Pool (so the Postgres Ping in OnStart
+		// actually runs, proving the connection works at startup).
 		fx.Invoke(func(*http.Server) {}),
+		fx.Invoke(func(*pgxpool.Pool) {}),
 	).Run()
 }
