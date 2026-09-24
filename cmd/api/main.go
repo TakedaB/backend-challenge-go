@@ -20,6 +20,7 @@ func main() {
 			postgres.NewLedgerRepository,
 			postgres.NewWagerTransactionRepository,
 			app.NewWalletService,
+			httpapi.NewAuthConfigFromEnv,
 			httpapi.NewWalletHandler,
 			httpapi.NewWagerTransactionHandler,
 			httpapi.NewRouter,

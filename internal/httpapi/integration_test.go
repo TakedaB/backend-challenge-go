@@ -18,9 +18,6 @@ import (
 	"github.com/TakedaB/backend-challenge-go/internal/infra/postgres"
 )
 
-// connectTestPool mirrors the same helper in the postgres package —
-// duplicated here (rather than exported and imported) because it's a
-// handful of lines and keeps this package's tests self-contained.
 func connectTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	cfg := postgres.NewConfigFromEnv()
@@ -46,35 +43,52 @@ func newTestUUID(t *testing.T) string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// newTestServer wires the real handlers and router against the real
-// test Postgres pool — the same construction Fx does in cmd/api/main.go,
-// just assembled by hand so the test doesn't need the Fx container.
-func newTestServer(t *testing.T) (*httptest.Server, *pgxpool.Pool) {
+// testServer bundles the httptest.Server with the auth token the
+// AuthMiddleware requires, so every request helper below can attach
+// it automatically instead of every test doing it by hand.
+type testServer struct {
+	*httptest.Server
+	authToken string
+}
+
+// newTestServer wires the real handlers, router and auth middleware
+// against the real test Postgres pool — the same construction Fx does
+// in cmd/api/main.go, just assembled by hand so the test doesn't need
+// the Fx container.
+func newTestServer(t *testing.T) (*testServer, *pgxpool.Pool) {
 	t.Helper()
 	pool := connectTestPool(t)
 
+	authCfg := NewAuthConfigFromEnv()
 	walletRepo := postgres.NewWalletRepository(pool)
 	ledgerRepo := postgres.NewLedgerRepository(pool)
 	txRepo := postgres.NewWagerTransactionRepository(pool)
 	service := app.NewWalletService(walletRepo, ledgerRepo, txRepo)
 	walletHandler := NewWalletHandler(service)
 	wagerHandler := NewWagerTransactionHandler(service)
-	mux := NewRouter(walletHandler, wagerHandler)
+	mux := NewRouter(authCfg, walletHandler, wagerHandler)
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return srv, pool
+	return &testServer{Server: srv, authToken: authCfg.Token}, pool
 }
 
-func postJSON(t *testing.T, url string, body any) (*http.Response, map[string]any) {
+func (ts *testServer) postJSON(t *testing.T, path string, body any) (*http.Response, map[string]any) {
 	t.Helper()
 	b, err := json.Marshal(body)
 	if err != nil {
 		t.Fatalf("marshaling request body: %v", err)
 	}
-	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
+	req, err := http.NewRequest(http.MethodPost, ts.URL+path, bytes.NewReader(b))
 	if err != nil {
-		t.Fatalf("POST %s: %v", url, err)
+		t.Fatalf("building request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+ts.authToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", path, err)
 	}
 	defer resp.Body.Close()
 
@@ -85,11 +99,17 @@ func postJSON(t *testing.T, url string, body any) (*http.Response, map[string]an
 	return resp, parsed
 }
 
-func getJSON(t *testing.T, url string) (*http.Response, map[string]any) {
+func (ts *testServer) getJSON(t *testing.T, path string) (*http.Response, map[string]any) {
 	t.Helper()
-	resp, err := http.Get(url)
+	req, err := http.NewRequest(http.MethodGet, ts.URL+path, nil)
 	if err != nil {
-		t.Fatalf("GET %s: %v", url, err)
+		t.Fatalf("building request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+ts.authToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
 	}
 	defer resp.Body.Close()
 
@@ -107,7 +127,7 @@ func getJSON(t *testing.T, url string) (*http.Response, map[string]any) {
 func TestIntegration_FullFlow(t *testing.T) {
 	srv, pool := newTestServer(t)
 
-	_, openResp := postJSON(t, srv.URL+"/wallets", map[string]any{
+	_, openResp := srv.postJSON(t, "/wallets", map[string]any{
 		"playerId":       "player-" + newTestUUID(t),
 		"currency":       "BRL",
 		"initialBalance": "100.00",
@@ -123,7 +143,7 @@ func TestIntegration_FullFlow(t *testing.T) {
 		t.Errorf("open wallet balance = %v, want 100.00", openResp["balance"])
 	}
 
-	betResp, betBody := postJSON(t, srv.URL+"/wagering/transactions", map[string]any{
+	betResp, betBody := srv.postJSON(t, "/wagering/transactions", map[string]any{
 		"externalTransactionId": "ext-" + newTestUUID(t),
 		"providerId":            "provider-a",
 		"idempotencyKey":        "idem-" + newTestUUID(t),
@@ -142,7 +162,7 @@ func TestIntegration_FullFlow(t *testing.T) {
 		t.Errorf("BET state = %v, want PROCESSED", betBody["state"])
 	}
 
-	_, walletAfter := getJSON(t, srv.URL+"/wallets/"+walletID)
+	_, walletAfter := srv.getJSON(t, "/wallets/"+walletID)
 	if walletAfter["balance"] != "70.00" {
 		t.Errorf("balance after BET = %v, want 70.00", walletAfter["balance"])
 	}
@@ -154,7 +174,7 @@ func TestIntegration_FullFlow(t *testing.T) {
 func TestIntegration_Idempotency(t *testing.T) {
 	srv, pool := newTestServer(t)
 
-	_, openResp := postJSON(t, srv.URL+"/wallets", map[string]any{
+	_, openResp := srv.postJSON(t, "/wallets", map[string]any{
 		"playerId":       "player-" + newTestUUID(t),
 		"currency":       "BRL",
 		"initialBalance": "100.00",
@@ -180,14 +200,14 @@ func TestIntegration_Idempotency(t *testing.T) {
 		"currency":              "BRL",
 	}
 
-	_, first := postJSON(t, srv.URL+"/wagering/transactions", betRequest)
-	_, second := postJSON(t, srv.URL+"/wagering/transactions", betRequest)
+	_, first := srv.postJSON(t, "/wagering/transactions", betRequest)
+	_, second := srv.postJSON(t, "/wagering/transactions", betRequest)
 
 	if first["id"] != second["id"] {
 		t.Errorf("replayed request got a different transaction id: first=%v second=%v", first["id"], second["id"])
 	}
 
-	_, walletAfter := getJSON(t, srv.URL+"/wallets/"+walletID)
+	_, walletAfter := srv.getJSON(t, "/wallets/"+walletID)
 	if walletAfter["balance"] != "70.00" {
 		t.Errorf("balance after replayed BET = %v, want 70.00 (must not double-debit)", walletAfter["balance"])
 	}
@@ -196,13 +216,11 @@ func TestIntegration_Idempotency(t *testing.T) {
 // TestIntegration_ConcurrentBets_OnlyOneSucceeds is the README's
 // mandatory scenario at the level it actually matters: two real,
 // concurrent HTTP requests against the same wallet, going through the
-// full stack (handler -> service -> repository -> Postgres). This is
-// what proves the optimistic-lock version check works under genuine
-// concurrent load, not just sequential calls.
+// full stack (handler -> service -> repository -> Postgres).
 func TestIntegration_ConcurrentBets_OnlyOneSucceeds(t *testing.T) {
 	srv, pool := newTestServer(t)
 
-	_, openResp := postJSON(t, srv.URL+"/wallets", map[string]any{
+	_, openResp := srv.postJSON(t, "/wallets", map[string]any{
 		"playerId":       "player-" + newTestUUID(t),
 		"currency":       "BRL",
 		"initialBalance": "100.00",
@@ -221,7 +239,7 @@ func TestIntegration_ConcurrentBets_OnlyOneSucceeds(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			_, body := postJSON(t, srv.URL+"/wagering/transactions", map[string]any{
+			_, body := srv.postJSON(t, "/wagering/transactions", map[string]any{
 				"externalTransactionId": fmt.Sprintf("ext-concurrent-%d-%s", idx, newTestUUID(t)),
 				"providerId":            "provider-a",
 				"idempotencyKey":        fmt.Sprintf("idem-concurrent-%d-%s", idx, newTestUUID(t)),
@@ -249,8 +267,29 @@ func TestIntegration_ConcurrentBets_OnlyOneSucceeds(t *testing.T) {
 		t.Errorf("rejectedOrFailedCount = %d, want exactly 1", rejectedOrFailedCount)
 	}
 
-	_, walletAfter := getJSON(t, srv.URL+"/wallets/"+walletID)
+	_, walletAfter := srv.getJSON(t, "/wallets/"+walletID)
 	if walletAfter["balance"] != "20.00" {
 		t.Errorf("final balance = %v, want 20.00 (exactly one 80.00 debit from 100.00)", walletAfter["balance"])
+	}
+}
+
+// TestIntegration_RequiresAuth proves the endpoints reject requests
+// without a valid bearer token, and accept them with one — the
+// integration-level check of the new AuthMiddleware.
+func TestIntegration_RequiresAuth(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/wallets", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Content-Type", "application/json")
+	// Deliberately no Authorization header.
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request without token: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status without token = %d, want 401", resp.StatusCode)
 	}
 }
